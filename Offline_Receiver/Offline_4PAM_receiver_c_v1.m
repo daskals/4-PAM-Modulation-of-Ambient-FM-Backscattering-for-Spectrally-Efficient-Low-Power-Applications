@@ -1,0 +1,324 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%     Spiros Daskalakis                               %
+%     last Revision 16/7/2018                         %
+%     Site: www.Daskalakispiros.com                   %
+%     Email: Daskalakispiros@gmail.com                %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+clc; 
+close all; 
+clear all;
+
+%% RTL SDR parameters
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+GAIN=-15; 
+F_ADC = 1e6;  %1 MS/s 
+DEC = 1;
+Fs = F_ADC/DEC;
+Ts = 1/Fs;
+
+%% Sympol parameters
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+Tsymbol =5.85e-3 ;           % Symbol Duration
+Tbit=Tsymbol/2;              % Datarate= 1/Tbit
+over = round(Tsymbol/Ts);    % Oversampling factor 
+newover = 585;               % Downsample factor
+
+%%  Tag Packet parameters
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%Bitstreams lengths
+preamble_length=10;                % Prample=[10 00 10 00 10 01 11];
+id_length=2;                       % ID=[00];
+util_length=2;                     % Util=[01];
+codeword_length=14;                % DATA=[01 11 10 00 11];
+dummybit=0;                        % put a dummy bit at the end of packet bitstream for better reception
+%%% We use 4 PAM Modulation
+total_packet_length=(id_length+preamble_length+util_length+codeword_length+dummybit)/2;
+total_packet_duration=(total_packet_length)*Tsymbol;
+preamble_duration=preamble_length*Tbit;
+
+%% Sigmal Prosesing  Variables
+Resolution = 1;   % in Hz
+N_F = Fs/Resolution;
+F_axis = -Fs/2:Fs/N_F:Fs/2-Fs/N_F;
+
+%4 QAM Gray Code representation
+%(-3 || 00)----(-1 || 01)------(1 || 11)-----(3 || 10)
+
+% Preamble in bit format with symbols at the receiver.
+%We use it for synchonization
+preamble=[+3,-3,+3,-3, +3];
+preamble_neg=-1*preamble;
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%We send a fixed packet =[-1 +1 -3 -1 -1 +1 +3 -3 +1]
+%We compare the packet with the outcome of the algorithm in order to count
+%the error/correct packets
+fixedpacketdata=[0 1 1 1 0 0  0 1  0 1  1 1  1 0  0 0  1 1];  % id + sensor_id + fixedata  
+
+%% Capture Window Parameters
+framelength=3;                                      % Window=3*packet_length
+t_sampling = framelength*total_packet_duration;     % Sampling time frame (seconds).
+N_samples = round(Fs*t_sampling);
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Import Datasets
+dataset1=load('FM_amb_98_5_Mhz_100_packets_1Msps_v1_CW.mat');
+stream=dataset1.dataset;
+% put All the data in a line =>same as Linux fifo
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Debug Print variables => activate and deactive the plots
+DEBUG_en1=0;
+DEBUG_en2=1;
+DEBUG_en3=1;
+DEBUG_en5=0;
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Decoder General variables
+correct_packets=0;
+error_packets=0;
+cut_packets=0;   
+negative_starts1=0;
+negative_starts2=0;
+droped_packets=0;
+pos=1;
+packets = 1;
+counter=0;
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Decoder   vector initialization
+decision_bits_B=zeros(1,length(fixedpacketdata));
+matcheds=ones(round(Tsymbol/Ts),1); % the pulse of matched filter has duration Tsymbol
+BER_sum=[];
+infomatr=[];
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%Start the algorithm loop
+N=101
+while packets<N
+      
+      % Load Window (3*packet_length) to the buffer (don't need to do deinterleaving here)
+      x=stream(pos:pos+N_samples-1);
+      
+      counter = counter + 1;
+      % delay every two windows || ===> capture__delay(duration=packet_window)__capture__delay__......
+    if ~mod(counter, 2)     
+          
+           packets = packets + 1;
+           fprintf('Packet: %d|\n',packets)
+
+           %% Absolute operation removes the unknown CFO
+           abstream=abs(x).^2;
+
+           %% Matched filtering
+            dataconv=conv(abstream,matcheds);   %  aply the filter with convolution
+            %fix the ampliture of the convolution
+            %dataconv=dataconv(1:length(abstream))/length(matcheds);
+            dataconv=dataconv(length(matcheds):length(abstream))/length(matcheds);
+            %% Downsample same prosedure
+            total_env_ds = dataconv(1:over/newover:end); %% by factor of 10 to reduce the computational complexity
+            
+             %% Time sync of downsample
+             total_envelope = total_env_ds(newover+1:end-newover+1); % total_env_ds(newover+1:end-newover+1); 
+             %% remove the DC offset
+             total_envelope=total_envelope-mean(total_envelope);
+             %%na allazo to total_envelope apo  total_env_ds
+             %----------------------------------------------------------------------
+             %check the energy  and reject the noisy data
+             for k=1:1: length(total_envelope)- (total_packet_length*newover)+1
+                 energy_synq(k)=sum(abs(total_envelope(k : k+total_packet_length*newover-1-newover)).^2);          
+             end
+                [energy_sinq_max  energy_sinq_ind]=max(energy_synq); 
+                 pointer1=energy_sinq_ind-total_packet_length*newover;               
+
+                if pointer1<=0   
+                    negative_starts2=negative_starts2+1;
+                     disp 'Negative start_2';
+                    continue;
+             end
+           %---------------------------------------------------------------------------
+         %% FFT plot 1  
+         if DEBUG_en1==1
+                    
+                     x_fft = fftshift(fft(x, N_F));
+                     %F_sensor_est_power=10*log10((abs(x_fft).^2)*Ts/50*1e3)-15; 
+                     figure(1);
+                     plot(F_axis/1000000, F_sensor_est_power);
+                     title('Frequency Domain')  
+                     xlabel('Frequency (MHz)');
+                     drawnow;               
+          end
+           
+            if DEBUG_en2==1
+                    time_axis= 0:Ts:Ts*length(abstream)-Ts;
+                    figure(2);
+                    subplot(2, 1, 1);
+                    plot(time_axis,abstream);
+                    title('Initial Signal', 'FontSize',14)
+                    xlabel('Time (Sec)');
+                    ylabel('Amplitude (a.u.)');
+                    grid on; 
+                    subplot(2, 1, 2);
+                    time_comv=0:Ts:Ts*length(dataconv)-Ts;
+                    plot(time_comv,dataconv)
+                    title('Low Pass', 'FontSize',14)
+                    xlabel('Time (Sec)');
+                    ylabel('Amplitude (a.u.)');
+                    grid on;              
+            end 
+            
+            
+            %% dc zero offser
+             %% Assume symbol synchronization, which can be implemented using correlation with a sequence of known bits in the preamble       
+             % comparison of the detected preamble bits with the a priori known bit sequence
+             %convert the header to a time series for the specific sampling frequency and bit duration. 
+            %% create the preamble neover format
+            preample_neover=upsample(preamble, newover);
+            preample_neg_neover=upsample(preamble_neg, newover);
+            
+            %% Sync via preamble correlation
+            corrsync_out = xcorr(preample_neover, total_envelope);
+            corrsync_out_neg = xcorr(preample_neg_neover, total_envelope);
+
+            [m ind] = max(corrsync_out);
+            [m_neg ind_neg] = max(corrsync_out_neg);
+            %notice that correlation produces a 1x(2L-1) vector, so index must be shifted.
+            %the following operation points to the "start" of the packet.
+             
+            if (m < m_neg)
+               start = length(total_envelope)-ind_neg;
+               total_envelope=-total_envelope;
+               start1=start;
+            else
+               start = length(total_envelope)-ind;
+               start2=start;
+            end
+           % Reject packets
+            if(start <= 0)
+                negative_starts1 = negative_starts1 + 1;
+                disp 'Negative start';
+                continue;
+            elseif start+((total_packet_length))*newover > length(total_envelope)  %% Check if the detected packet is cut in the middle.
+                cut_packets = cut_packets + 1;
+                disp 'Packet cut in the middle!';
+                continue;
+            end 
+            
+            %Take the Mean and the Variance values from the preamble
+            %cut the usefull signal 
+            %Go around each know symbol of the preamble and take newover/12
+            %symbols
+            as=ceil(newover/12);
+            simashifted=total_envelope(start:start+total_packet_length*newover);
+            
+            %Symbol: (-3)
+            Sm3=simashifted(3*newover-as:3*newover+as);
+            V0= var(Sm3);
+            M0=mean(Sm3);
+            %Symbol: (+3)
+            Sp3=simashifted(4*newover-as:4*newover+as);
+            V3= var(Sp3);
+            M3=mean(Sp3);
+            %Symbol: (-1)
+            Sm1=simashifted(5*newover-as:5*newover+as);
+            V1= var(Sm1);
+            M1=mean(Sm1);
+            %Symbol: (+1)
+            Sp1=simashifted(6*newover-as:6*newover+as);
+            V2= var(Sp1);
+            M2=mean(Sp1);
+            %Put the M kai V in veectors
+            V=[V0 V1 V2 V3];
+            M=[M0 M1 M2 M3];
+            
+         %Caltulate the thresholds 
+         % We have implement two fuctions with three different threshold forms
+         
+         %[SimpleTress01,SimpleTress12, SimpleTress23] = ThresholdsWay1(V,M);
+         [SimpleTress01,SimpleTress12, SimpleTress23] = ThresholdsWay2(V,M);
+           
+           
+            shifted_sync_signal_B=total_envelope(start+length(preample_neover)+1: start+total_packet_length*newover);
+            x=shifted_sync_signal_B(1:newover:end);
+
+            % quantize the input signal x to the alphabet
+            % using nearest neighbor method
+
+            % alphabet: -3; -1; 1; 3
+            ipHat(find(x< SimpleTress01)) = -3;
+            ipHat(find(x>= SimpleTress23)) = 3;
+            ipHat(find(x>=SimpleTress01 & x<SimpleTress12)) = -1;
+            ipHat(find(x>=SimpleTress12 & x<SimpleTress23)) = 1;
+            y_bits=ipHat
+         
+            
+             if DEBUG_en3==1;
+                    figure(6);
+                    clf('reset')
+                    y1=1:newover:length(shifted_sync_signal_B);
+                    plot(y1,x, '*');
+                    hold on 
+                    plot(shifted_sync_signal_B);                    
+                    plot(SimpleTress01*ones(1,length(shifted_sync_signal_B)),'-');
+                    plot(SimpleTress12*ones(1,length(shifted_sync_signal_B)),'-');
+                    plot(SimpleTress23*ones(1,length(shifted_sync_signal_B)), '-');
+                    title('Start Points' ,'FontSize',14)
+                    legend('Start Symbol Point','Packet-Signal', 'Thres01', 'Thres12', 'Thres23')
+                    grid on;
+                    drawnow;
+            end   
+           
+            bitsind=1;
+            %(-3 || 00)----(-1 || 01)------(1 || 11)-----(3 || 10)
+            for i=1:length(y_bits)
+                if y_bits(i)==-3
+                    decision_bits_B (bitsind)=0;
+                    decision_bits_B (bitsind+1)=0;
+                elseif y_bits(i)==-1
+                    decision_bits_B (bitsind)=0;
+                    decision_bits_B (bitsind+1)=1;
+                elseif y_bits(i)==1
+                    decision_bits_B (bitsind)=1;
+                    decision_bits_B (bitsind+1)=1;
+                elseif y_bits(i)==3
+                    decision_bits_B (bitsind)=1;
+                    decision_bits_B (bitsind+1)=0;
+                end
+                bitsind=bitsind+2;
+            end 
+            
+             final_packet=decision_bits_B;
+             
+                if  isequal(final_packet, fixedpacketdata)
+                      disp 'Packet Correct !!!!!!!!!!!!!!!!!!!!!!!!!';
+                       correct_packets=correct_packets+1;      
+                       %if (error_packets==2)
+                        %return;
+                       %end 
+                else
+                        disp 'Packet WRONGGGG------------------------';  
+                        error_packets=error_packets+1;
+                        BER_sum(error_packets) = sum(xor(decision_bits_B,fixedpacketdata));
+                        %if (error_packets==3)
+                        %return;
+                        %end
+                end  
+          
+
+            
+       end 
+         pos=pos+N_samples;
+         decision_bits_B=zeros(1,length(fixedpacketdata));
+end    
+
+           infomatr(1)=correct_packets;
+           infomatr(2)=error_packets;
+           infomatr(3)=negative_starts1+negative_starts2;
+           infomatr(4)=cut_packets;
+           infomatr(5)=error_packets /(correct_packets+error_packets);
+           infomatr(6)= sum(BER_sum);
+           infomatr(7)= sum(BER_sum)/((correct_packets+error_packets)*length(fixedpacketdata));
+            
+            fprintf('Corecct Packets=%d|Packet Error=%d\n',correct_packets, error_packets) 
+            fprintf('Negative Starts=%d|Cut Packets=%d\n', negative_starts1, cut_packets)
+            fprintf('Negative Starts2=%d\n', negative_starts2)
+            %PER is the number of incorrectly received data packets divided by the total number of received packets.
+            fprintf('Packet Error Rate=%d\n', error_packets / (correct_packets+error_packets)) 
+            fprintf('Bit error rate (BER)=%d\n', sum(BER_sum)/((correct_packets+error_packets)*length(fixedpacketdata)))
+
+            
